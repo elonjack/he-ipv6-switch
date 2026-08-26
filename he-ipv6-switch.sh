@@ -170,8 +170,7 @@ enable_he() {
   say ''
   say 'HE 独占 IPv6 已启用，并已设为开机自启。'
   say "当前 HE 业务地址：$he_host"
-  say "检查：systemctl status he-ipv6-switch.service"
-  say "恢复原生 IPv6：sudo $INSTALL_PATH，然后选择 2"
+  say '日后重新运行本脚本，选择菜单 2，即可恢复原生 IPv6。'
 }
 
 restore_native() {
