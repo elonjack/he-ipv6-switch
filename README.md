@@ -9,7 +9,7 @@
 - 禁用公网网卡上的原生 IPv6，从而让 IPv6 默认入站/出站使用 HE；
 - 安装 systemd 服务，重启后自动恢复 HE 模式。
 
-若系统已经启用 `vps-security-bootstrap` v1.3.10 或更新版本的 nftables 防火墙，脚本会自动识别它，并仅放行当前 HE `Server IPv4 Address` 发来的 IPv4 协议 41（SIT）流量。换 HE 节点时会先加入新端点、成功后删除旧端点；恢复原生 IPv6 时会删除本脚本创建的该白名单。未检测到兼容且已启用的防火墙时，脚本不会修改任何防火墙规则。
+若系统已经启用 `vps-security-bootstrap` v1.3.11 或更新版本的 nftables 防火墙，脚本会自动识别它，并仅放行当前 HE `Server IPv4 Address` 发来的 IPv4 协议 41（SIT）流量。换 HE 节点时会先加入新端点、成功后删除旧端点；恢复原生 IPv6 时会删除本脚本创建的该白名单。未检测到兼容且已启用的防火墙时，脚本不会修改任何防火墙规则。
 
 这条自动规则只写入固定的 root-only 文件 `/etc/vps-security/he-protocol41.nft`，不会改 SSH、TCP/UDP 放行端口或其他规则。没有使用 HE 的 VPS 中，该文件为空；Bootstrap 不再加载可被目录中任意 `.nft` 文件扩展的通配符入口。没有使用 Bootstrap 的 VPS 也不会因此出现新端口、新协议或额外防火墙策略；HE 脚本会仅配置隧道，并由你现有的防火墙/云安全组决定协议 41 是否可通过。
 
