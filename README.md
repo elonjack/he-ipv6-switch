@@ -45,6 +45,8 @@ bash /root/he-ipv6-switch.sh
 
 按菜单选择“启用 / 重新配置 HE 独占 IPv6”。日后再次运行同一脚本，选择“恢复原生 IPv6”即可切回。
 
+当脚本提示“从 Routed 前缀中选一个给 VPS 使用的 HE IPv6”时，直接按回车即可。脚本会默认使用该前缀内的 `::1` 地址；也可以手动输入该前缀内的其他未使用地址。
+
 ## 前置条件与注意事项
 
 - 系统须为使用 systemd 和 iproute2 的 Linux（例如 Debian、Ubuntu）。

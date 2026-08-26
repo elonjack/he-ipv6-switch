@@ -114,7 +114,7 @@ enable_he() {
   say ''
   say '请打开 HE Tunnel Details 页面，逐项照抄下列字段。'
   say '「Server IPv6 Address」仅用于核对，系统不需要把它当网关填写。'
-  local server_ipv4 server_ipv6 client_ipv4 client_ipv6 routed64 routed48 choice routed_prefix he_host
+  local server_ipv4 server_ipv6 client_ipv4 client_ipv6 routed64 routed48 choice routed_prefix default_he_host he_host
   server_ipv4="$(ask 'Server IPv4 Address')"
   server_ipv6="$(ask 'Server IPv6 Address（仅核对，会保存）')"
   client_ipv4="$(ask 'Client IPv4 Address（必须与 HE 后台登记完全一致）' "$detected_ipv4")"
@@ -142,7 +142,10 @@ enable_he() {
     2) routed_prefix="$routed64" ;;
     *) die '只能选择 1 或 2。' ;;
   esac
-  he_host="$(ask "从 $routed_prefix 中选一个给 VPS 使用的 HE IPv6（不带 /长度，例如 ...::1）")"
+  # HE displays routed prefixes in compressed form (for example ...::/48).
+  # The first usable address is a sensible default and avoids manual typo risk.
+  default_he_host="${routed_prefix%/*}1"
+  he_host="$(ask "从 $routed_prefix 中选一个给 VPS 使用的 HE IPv6（直接回车使用默认地址）" "$default_he_host")"
   required "$he_host"; valid_ipv6 "$he_host"
 
   say ''
