@@ -11,16 +11,28 @@ DOWN_SCRIPT="/usr/local/lib/he-ipv6-switch/down"
 SERVICE_FILE="/etc/systemd/system/he-ipv6-switch.service"
 IFACE="he-ipv6"
 
-say() { printf '%s\n' "$*"; }
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  YELLOW='\033[1;33m'
+  RED='\033[1;31m'
+  RESET='\033[0m'
+else
+  YELLOW=''
+  RED=''
+  RESET=''
+fi
+
+say() { printf '%b%s%b\n' "$YELLOW" "$*" "$RESET"; }
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
 need_root() { [ "${EUID}" -eq 0 ] || die "请用 root 运行：sudo bash $0"; }
 ask() {
   local label="$1" default="${2:-}" answer
   if [ -n "$default" ]; then
-    read -r -p "$label [$default]: " answer
+    printf '%b%s [%s]: %b' "$YELLOW" "$label" "$default" "$RESET" >&2
+    read -r answer
     printf '%s' "${answer:-$default}"
   else
-    read -r -p "$label: " answer
+    printf '%b%s: %b' "$YELLOW" "$label" "$RESET" >&2
+    read -r answer
     printf '%s' "$answer"
   fi
 }
