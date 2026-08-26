@@ -14,7 +14,8 @@ IFACE="he-ipv6"
 BOOTSTRAP_FIREWALL_CONFIG="/etc/vps-security/nftables.conf"
 BOOTSTRAP_FIREWALL_LOADER="/usr/local/sbin/vps-security-load-firewall"
 BOOTSTRAP_FIREWALL_TABLE="vps_security_bootstrap"
-BOOTSTRAP_FIREWALL_EXTENSION_DIR="/etc/vps-security/nftables-input.d"
+BOOTSTRAP_FIREWALL_RULE_FILE="/etc/vps-security/he-protocol41.nft"
+BOOTSTRAP_FIREWALL_LEGACY_EXTENSION_DIR="/etc/vps-security/nftables-input.d"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   YELLOW='\033[1;33m'
@@ -134,13 +135,23 @@ default_host_for_prefix() {
     "${hex:16:4}" "${hex:20:4}" "${hex:24:4}"
 }
 have_setup() { [ -f "$CONFIG_FILE" ] && [ -f "$SERVICE_FILE" ]; }
-bootstrap_firewall_active() {
+bootstrap_firewall_rule_file() {
   [ -x "$BOOTSTRAP_FIREWALL_LOADER" ] &&
     [ -f "$BOOTSTRAP_FIREWALL_CONFIG" ] &&
-    [ -d "$BOOTSTRAP_FIREWALL_EXTENSION_DIR" ] &&
-    grep -Fq "include \"$BOOTSTRAP_FIREWALL_EXTENSION_DIR/*.nft\"" "$BOOTSTRAP_FIREWALL_CONFIG" &&
     systemctl is-active --quiet nftables &&
-    nft list table inet "$BOOTSTRAP_FIREWALL_TABLE" >/dev/null 2>&1
+    nft list table inet "$BOOTSTRAP_FIREWALL_TABLE" >/dev/null 2>&1 || return 1
+  if grep -Fq "include \"$BOOTSTRAP_FIREWALL_RULE_FILE\"" "$BOOTSTRAP_FIREWALL_CONFIG" &&
+    [ -f "$BOOTSTRAP_FIREWALL_RULE_FILE" ] && [ ! -L "$BOOTSTRAP_FIREWALL_RULE_FILE" ]; then
+    printf '%s' "$BOOTSTRAP_FIREWALL_RULE_FILE"
+  elif grep -Fq "include \"$BOOTSTRAP_FIREWALL_LEGACY_EXTENSION_DIR/*.nft\"" "$BOOTSTRAP_FIREWALL_CONFIG" &&
+    [ -d "$BOOTSTRAP_FIREWALL_LEGACY_EXTENSION_DIR" ]; then
+    printf '%s/50-he-ipv6-switch.nft' "$BOOTSTRAP_FIREWALL_LEGACY_EXTENSION_DIR"
+  else
+    return 1
+  fi
+}
+bootstrap_firewall_active() {
+  bootstrap_firewall_rule_file >/dev/null
 }
 
 write_helpers() {
@@ -154,8 +165,8 @@ set -Eeuo pipefail
 CONFIG=/etc/vps-security/nftables.conf
 LOADER=/usr/local/sbin/vps-security-load-firewall
 TABLE=vps_security_bootstrap
-EXTENSION_DIR=/etc/vps-security/nftables-input.d
-RULE_FILE="$EXTENSION_DIR/50-he-ipv6-switch.nft"
+RULE_FILE=/etc/vps-security/he-protocol41.nft
+LEGACY_RULE_FILE=/etc/vps-security/nftables-input.d/50-he-ipv6-switch.nft
 
 is_ipv4() {
   local candidate=$1 a b c d extra
@@ -166,12 +177,18 @@ is_ipv4() {
   done
 }
 
-has_active_bootstrap_firewall() {
+active_rule_file() {
   [ "${BOOTSTRAP_FIREWALL:-0}" = 1 ] &&
-    [ -x "$LOADER" ] && [ -f "$CONFIG" ] && [ -d "$EXTENSION_DIR" ] &&
-    grep -Fq "include \"$EXTENSION_DIR/*.nft\"" "$CONFIG" &&
+    [ -x "$LOADER" ] && [ -f "$CONFIG" ] &&
     systemctl is-active --quiet nftables &&
-    nft list table inet "$TABLE" >/dev/null 2>&1
+    nft list table inet "$TABLE" >/dev/null 2>&1 || return 1
+  if grep -Fq "include \"$RULE_FILE\"" "$CONFIG" && [ -f "$RULE_FILE" ] && [ ! -L "$RULE_FILE" ]; then
+    printf '%s' "$RULE_FILE"
+  elif grep -Fq 'include "/etc/vps-security/nftables-input.d/*.nft"' "$CONFIG" && [ -d "${LEGACY_RULE_FILE%/*}" ]; then
+    printf '%s' "$LEGACY_RULE_FILE"
+  else
+    return 1
+  fi
 }
 
 render_rule() {
@@ -186,7 +203,7 @@ render_rule() {
     nft_sources+="${nft_sources:+, }$source"
   done
   [ -n "$nft_sources" ] || return 1
-  printf '# Managed by HE IPv6 Switch. Do not edit; it is removed when HE is disabled.\n'
+  printf '# Managed by HE IPv6 Switch. Do not edit; this file is emptied when HE is disabled.\n'
   if [[ "$nft_sources" == *,* ]]; then
     printf 'ip saddr { %s } ip protocol 41 accept comment "HE IPv6 SIT tunnel"\n' "$nft_sources"
   else
@@ -195,44 +212,65 @@ render_rule() {
 }
 
 apply_rule() {
-  local sources=$1 temporary backup=''
-  has_active_bootstrap_firewall || {
+  local sources=$1 temporary backup='' active_rule rule_dir
+  active_rule=$(active_rule_file) || {
     printf 'vps-security-bootstrap 防火墙未处于兼容且启用的状态，未修改防火墙。\n' >&2
     return 1
   }
-  install -d -o root -g root -m 0700 "$EXTENSION_DIR"
-  temporary=$(mktemp "$EXTENSION_DIR/.50-he-ipv6-switch.nft.XXXXXX")
+  rule_dir=${active_rule%/*}
+  install -d -o root -g root -m 0700 "$rule_dir"
+  temporary=$(mktemp "$rule_dir/.he-ipv6-switch.nft.XXXXXX")
   render_rule "$sources" > "$temporary"
   chmod 0600 "$temporary"
-  if [ -e "$RULE_FILE" ]; then
-    backup=$(mktemp "$EXTENSION_DIR/.50-he-ipv6-switch.backup.XXXXXX")
-    cp -a "$RULE_FILE" "$backup"
+  if [ -e "$active_rule" ]; then
+    backup=$(mktemp "$rule_dir/.he-ipv6-switch.backup.XXXXXX")
+    cp -a "$active_rule" "$backup"
   fi
-  mv -f "$temporary" "$RULE_FILE"
+  mv -f "$temporary" "$active_rule"
   if ! "$LOADER"; then
-    if [ -n "$backup" ]; then mv -f "$backup" "$RULE_FILE"; else rm -f "$RULE_FILE"; fi
+    if [ -n "$backup" ]; then mv -f "$backup" "$active_rule"; else rm -f "$active_rule"; fi
     "$LOADER" 2>/dev/null || true
     printf 'HE 协议 41 白名单重载失败，已恢复原防火墙片段。\n' >&2
     return 1
   fi
   [ -z "$backup" ] || rm -f "$backup"
+  # After migration to the fixed rule file, the old path is no longer loaded.
+  [ "$active_rule" != "$RULE_FILE" ] || rm -f "$LEGACY_RULE_FILE"
 }
 
 remove_rule() {
-  local backup=''
-  [ -e "$RULE_FILE" ] || return 0
-  backup=$(mktemp "$EXTENSION_DIR/.50-he-ipv6-switch.backup.XXXXXX")
-  cp -a "$RULE_FILE" "$backup"
-  rm -f "$RULE_FILE"
-  if has_active_bootstrap_firewall; then
+  local active_rule='' rule_file backup_dir backup_file removed=0
+  active_rule=$(active_rule_file || true)
+  backup_dir=$(mktemp -d /etc/vps-security/.he-ipv6-switch.remove.XXXXXX) || return 1
+  for rule_file in "$RULE_FILE" "$LEGACY_RULE_FILE"; do
+    [ -e "$rule_file" ] || continue
+    [ -f "$rule_file" ] && [ ! -L "$rule_file" ] || { rm -rf -- "$backup_dir"; return 1; }
+    backup_file="$backup_dir/$(basename "$rule_file")"
+    cp -a "$rule_file" "$backup_file" || { rm -rf -- "$backup_dir"; return 1; }
+    if [ "$rule_file" = "$RULE_FILE" ]; then
+      # Bootstrap always includes this exact file; keep it as an empty,
+      # root-only file when HE is disabled so a firewall reload stays valid.
+      : > "$rule_file"
+      chmod 0600 "$rule_file"
+    else
+      rm -f "$rule_file"
+    fi
+    removed=1
+  done
+  [ "$removed" = 1 ] || { rm -rf -- "$backup_dir"; return 0; }
+  if [ -n "$active_rule" ]; then
     if ! "$LOADER"; then
-      mv -f "$backup" "$RULE_FILE"
+      for rule_file in "$RULE_FILE" "$LEGACY_RULE_FILE"; do
+        backup_file="$backup_dir/$(basename "$rule_file")"
+        [ ! -e "$backup_file" ] || mv -f "$backup_file" "$rule_file"
+      done
       "$LOADER" 2>/dev/null || true
       printf '移除 HE 协议 41 白名单失败，已恢复原防火墙片段。\n' >&2
+      rm -rf -- "$backup_dir"
       return 1
     fi
   fi
-  rm -f "$backup"
+  rm -rf -- "$backup_dir"
 }
 
 case "${1:-}" in
@@ -436,6 +474,9 @@ restore_native() {
     return
   fi
   . "$CONFIG_FILE"
+  # Refresh helpers first so a newer downloaded script can also clean up a
+  # firewall fragment created by an older release.
+  write_helpers
   local confirm
   say '这会停止 HE 隧道、删除 HE 路由，并重新启用原生 IPv6。IPv4 不受影响。'
   confirm="$(ask '确认恢复原生 IPv6？输入 YES 继续')"
