@@ -110,7 +110,6 @@ enable_he() {
   primary_iface="$(ip -o -4 route show default 2>/dev/null | awk 'NR==1 {print $5}')"
   [ -n "$primary_iface" ] || die "无法找出 VPS 的 IPv4 默认网卡。"
   detected_ipv4="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
-  native_disabled="$(cat "/proc/sys/net/ipv6/conf/${primary_iface}/disable_ipv6")"
 
   say ''
   say '请打开 HE Tunnel Details 页面，逐项照抄下列字段。'
@@ -156,10 +155,13 @@ enable_he() {
   confirm="$(ask '确认启用 HE 独占 IPv6？输入 YES 继续')"
   [ "$confirm" = 'YES' ] || { say '已取消，未修改任何配置。'; return; }
 
-  # If reconfiguring, first restore the last state so old resources cannot linger.
+  # When reconfiguring, restore the previous state first. Reading disable_ipv6
+  # afterwards preserves the actual pre-HE value instead of saving HE's "1".
   if have_setup; then
     systemctl disable --now he-ipv6-switch.service 2>/dev/null || true
+    "$DOWN_SCRIPT" 2>/dev/null || true
   fi
+  native_disabled="$(cat "/proc/sys/net/ipv6/conf/${primary_iface}/disable_ipv6")"
 
   umask 077
   {
@@ -195,7 +197,10 @@ restore_native() {
   say '这会停止 HE 隧道、删除 HE 路由，并重新启用原生 IPv6。IPv4 不受影响。'
   confirm="$(ask '确认恢复原生 IPv6？输入 YES 继续')"
   [ "$confirm" = 'YES' ] || { say '已取消。'; return; }
-  systemctl disable --now he-ipv6-switch.service
+  systemctl disable --now he-ipv6-switch.service || true
+  # If the unit had already failed, systemd may skip ExecStop; run the
+  # idempotent cleanup helper once more to guarantee native IPv6 is restored.
+  "$DOWN_SCRIPT" || true
   systemctl daemon-reload
   say '原生 IPv6 已重新启用。若依赖 SLAAC/DHCPv6，地址和默认路由可能需要数秒恢复。'
 }
