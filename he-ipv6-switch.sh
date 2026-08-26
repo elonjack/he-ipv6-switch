@@ -8,8 +8,13 @@ INSTALL_PATH="/usr/local/sbin/he-ipv6-switch"
 CONFIG_FILE="/etc/he-ipv6-switch.conf"
 UP_SCRIPT="/usr/local/lib/he-ipv6-switch/up"
 DOWN_SCRIPT="/usr/local/lib/he-ipv6-switch/down"
+FIREWALL_HELPER="/usr/local/lib/he-ipv6-switch/firewall"
 SERVICE_FILE="/etc/systemd/system/he-ipv6-switch.service"
 IFACE="he-ipv6"
+BOOTSTRAP_FIREWALL_CONFIG="/etc/vps-security/nftables.conf"
+BOOTSTRAP_FIREWALL_LOADER="/usr/local/sbin/vps-security-load-firewall"
+BOOTSTRAP_FIREWALL_TABLE="vps_security_bootstrap"
+BOOTSTRAP_FIREWALL_EXTENSION_DIR="/etc/vps-security/nftables-input.d"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   YELLOW='\033[1;33m'
@@ -43,9 +48,114 @@ valid_cidr() {
   [[ "$1" == */* && "$1" =~ ^[0-9A-Fa-f:]+/[0-9]{1,3}$ ]] || die "IPv6 地址或前缀格式错误：$1"
 }
 have_setup() { [ -f "$CONFIG_FILE" ] && [ -f "$SERVICE_FILE" ]; }
+bootstrap_firewall_active() {
+  [ -x "$BOOTSTRAP_FIREWALL_LOADER" ] &&
+    [ -f "$BOOTSTRAP_FIREWALL_CONFIG" ] &&
+    [ -d "$BOOTSTRAP_FIREWALL_EXTENSION_DIR" ] &&
+    grep -Fq "include \"$BOOTSTRAP_FIREWALL_EXTENSION_DIR/*.nft\"" "$BOOTSTRAP_FIREWALL_CONFIG" &&
+    systemctl is-active --quiet nftables &&
+    nft list table inet "$BOOTSTRAP_FIREWALL_TABLE" >/dev/null 2>&1
+}
 
 write_helpers() {
   install -d -m 0755 /usr/local/lib/he-ipv6-switch
+  cat > "$FIREWALL_HELPER" <<'EOF'
+#!/usr/bin/env bash
+# Manage only HE IPv6 Switch's protocol-41 firewall fragment.
+set -Eeuo pipefail
+. /etc/he-ipv6-switch.conf
+
+CONFIG=/etc/vps-security/nftables.conf
+LOADER=/usr/local/sbin/vps-security-load-firewall
+TABLE=vps_security_bootstrap
+EXTENSION_DIR=/etc/vps-security/nftables-input.d
+RULE_FILE="$EXTENSION_DIR/50-he-ipv6-switch.nft"
+
+is_ipv4() {
+  local candidate=$1 a b c d extra
+  IFS=. read -r a b c d extra <<< "$candidate"
+  [ -z "${extra:-}" ] && [ -n "${a:-}" ] && [ -n "${b:-}" ] && [ -n "${c:-}" ] && [ -n "${d:-}" ] || return 1
+  for value in "$a" "$b" "$c" "$d"; do
+    [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -le 255 ] || return 1
+  done
+}
+
+has_active_bootstrap_firewall() {
+  [ "${BOOTSTRAP_FIREWALL:-0}" = 1 ] &&
+    [ -x "$LOADER" ] && [ -f "$CONFIG" ] && [ -d "$EXTENSION_DIR" ] &&
+    grep -Fq "include \"$EXTENSION_DIR/*.nft\"" "$CONFIG" &&
+    systemctl is-active --quiet nftables &&
+    nft list table inet "$TABLE" >/dev/null 2>&1
+}
+
+render_rule() {
+  local sources=$1 source nft_sources='' seen=','
+  local -a values
+  IFS=, read -r -a values <<< "$sources"
+  [ "${#values[@]}" -gt 0 ] || return 1
+  for source in "${values[@]}"; do
+    is_ipv4 "$source" || { printf '无效 HE Server IPv4：%s\n' "$source" >&2; return 1; }
+    case "$seen" in *",$source,"*) continue ;; esac
+    seen+="$source,"
+    nft_sources+="${nft_sources:+, }$source"
+  done
+  [ -n "$nft_sources" ] || return 1
+  printf '# Managed by HE IPv6 Switch. Do not edit; it is removed when HE is disabled.\n'
+  if [[ "$nft_sources" == *,* ]]; then
+    printf 'ip saddr { %s } ip protocol 41 accept comment "HE IPv6 SIT tunnel"\n' "$nft_sources"
+  else
+    printf 'ip saddr %s ip protocol 41 accept comment "HE IPv6 SIT tunnel"\n' "$nft_sources"
+  fi
+}
+
+apply_rule() {
+  local sources=$1 temporary backup=''
+  has_active_bootstrap_firewall || {
+    printf 'vps-security-bootstrap 防火墙未处于兼容且启用的状态，未修改防火墙。\n' >&2
+    return 1
+  }
+  install -d -o root -g root -m 0700 "$EXTENSION_DIR"
+  temporary=$(mktemp "$EXTENSION_DIR/.50-he-ipv6-switch.nft.XXXXXX")
+  render_rule "$sources" > "$temporary"
+  chmod 0600 "$temporary"
+  if [ -e "$RULE_FILE" ]; then
+    backup=$(mktemp "$EXTENSION_DIR/.50-he-ipv6-switch.backup.XXXXXX")
+    cp -a "$RULE_FILE" "$backup"
+  fi
+  mv -f "$temporary" "$RULE_FILE"
+  if ! "$LOADER"; then
+    if [ -n "$backup" ]; then mv -f "$backup" "$RULE_FILE"; else rm -f "$RULE_FILE"; fi
+    "$LOADER" 2>/dev/null || true
+    printf 'HE 协议 41 白名单重载失败，已恢复原防火墙片段。\n' >&2
+    return 1
+  fi
+  [ -z "$backup" ] || rm -f "$backup"
+}
+
+remove_rule() {
+  local backup=''
+  [ -e "$RULE_FILE" ] || return 0
+  backup=$(mktemp "$EXTENSION_DIR/.50-he-ipv6-switch.backup.XXXXXX")
+  cp -a "$RULE_FILE" "$backup"
+  rm -f "$RULE_FILE"
+  if has_active_bootstrap_firewall; then
+    if ! "$LOADER"; then
+      mv -f "$backup" "$RULE_FILE"
+      "$LOADER" 2>/dev/null || true
+      printf '移除 HE 协议 41 白名单失败，已恢复原防火墙片段。\n' >&2
+      return 1
+    fi
+  fi
+  rm -f "$backup"
+}
+
+case "${1:-}" in
+  apply) apply_rule "${2:-}" ;;
+  remove) remove_rule ;;
+  *) printf '用法：%s {apply <HE_Server_IP[,HE_Server_IP]>|remove}\n' "$0" >&2; exit 2 ;;
+esac
+EOF
+
   cat > "$UP_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -64,6 +174,12 @@ ip -6 addr replace "$HE_HOST_IPV6/128" dev lo
 ip -6 route replace "$ROUTED_PREFIX" dev "$TUNNEL_IFACE" metric 25
 ip -6 route replace default dev "$TUNNEL_IFACE" metric 25 src "$HE_HOST_IPV6"
 
+# If the companion VPS Security Bootstrap firewall is active, install the
+# exact HE endpoint's protocol-41 allow rule before removing native IPv6.
+if [ "${BOOTSTRAP_FIREWALL:-0}" = 1 ]; then
+  /usr/local/lib/he-ipv6-switch/firewall apply "$SERVER_IPV4"
+fi
+
 # Removing IPv6 from the public NIC removes its addresses and native default route.
 # IPv4 is untouched. The previous value is restored by the stop/recover action.
 printf '1' > "/proc/sys/net/ipv6/conf/${NATIVE_IFACE}/disable_ipv6"
@@ -80,7 +196,7 @@ ip -6 addr del "$HE_HOST_IPV6/128" dev lo 2>/dev/null || true
 ip tunnel del "$TUNNEL_IFACE" 2>/dev/null || true
 printf '%s' "$NATIVE_DISABLE_IPV6" > "/proc/sys/net/ipv6/conf/${NATIVE_IFACE}/disable_ipv6" 2>/dev/null || true
 EOF
-  chmod 0755 "$UP_SCRIPT" "$DOWN_SCRIPT"
+  chmod 0755 "$FIREWALL_HELPER" "$UP_SCRIPT" "$DOWN_SCRIPT"
 }
 
 write_service() {
@@ -88,7 +204,7 @@ write_service() {
 [Unit]
 Description=HE IPv6 exclusive tunnel switch
 Wants=network-online.target
-After=network-online.target
+After=network-online.target nftables.service
 
 [Service]
 Type=oneshot
@@ -106,7 +222,7 @@ enable_he() {
   command -v ip >/dev/null || die "未找到 ip 命令，请安装 iproute2。"
   command -v systemctl >/dev/null || die "本脚本需要 systemd。"
 
-  local primary_iface detected_ipv4 native_disabled
+  local primary_iface detected_ipv4 native_disabled firewall_backend old_server_ipv4='' old_firewall_backend=0
   primary_iface="$(ip -o -4 route show default 2>/dev/null | awk 'NR==1 {print $5}')"
   [ -n "$primary_iface" ] || die "无法找出 VPS 的 IPv4 默认网卡。"
   detected_ipv4="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
@@ -148,21 +264,46 @@ enable_he() {
   he_host="$(ask "从 $routed_prefix 中选一个给 VPS 使用的 HE IPv6（直接回车使用默认地址）" "$default_he_host")"
   required "$he_host"; valid_ipv6 "$he_host"
 
+  if bootstrap_firewall_active; then
+    firewall_backend=1
+  else
+    firewall_backend=0
+  fi
+
   say ''
   say '将执行以下切换：'
   say "  • 隧道：$client_ipv4 → $server_ipv4"
   say "  • 业务 IPv6：$he_host（来自 $routed_prefix）"
   say "  • 禁用网卡 $primary_iface 上的原生 IPv6；所有 IPv6 默认流量改走 HE"
-  say '  • IPv4 不会改动；防火墙规则不会被放开。'
+  if [ "$firewall_backend" = 1 ]; then
+    say "  • 已检测到 vps-security-bootstrap：将仅允许 $server_ipv4 的协议 41。"
+  else
+    say '  • 未检测到已启用的兼容防火墙：不会修改防火墙。'
+  fi
   local confirm
   confirm="$(ask '确认启用 HE 独占 IPv6？输入 YES 继续')"
   [ "$confirm" = 'YES' ] || { say '已取消，未修改任何配置。'; return; }
+
+  # Add the new HE source before stopping an old tunnel, so an endpoint change
+  # never leaves the protocol-41 firewall rule absent during the handover.
+  if have_setup; then
+    . "$CONFIG_FILE"
+    old_server_ipv4="${SERVER_IPV4:-}"
+    old_firewall_backend="${BOOTSTRAP_FIREWALL:-0}"
+    if [ "$old_firewall_backend" = 1 ] && [ "$firewall_backend" = 1 ]; then
+      write_helpers
+      "$FIREWALL_HELPER" apply "$old_server_ipv4,$server_ipv4" || die '无法预先添加新 HE 节点的协议 41 白名单，已取消切换。'
+    fi
+  fi
 
   # When reconfiguring, restore the previous state first. Reading disable_ipv6
   # afterwards preserves the actual pre-HE value instead of saving HE's "1".
   if have_setup; then
     systemctl disable --now he-ipv6-switch.service 2>/dev/null || true
     "$DOWN_SCRIPT" 2>/dev/null || true
+    if [ "$old_firewall_backend" = 1 ] && [ "$firewall_backend" != 1 ]; then
+      "$FIREWALL_HELPER" remove || die 'HE 隧道已停止，但移除旧协议 41 白名单失败。'
+    fi
   fi
   native_disabled="$(cat "/proc/sys/net/ipv6/conf/${primary_iface}/disable_ipv6")"
 
@@ -177,6 +318,7 @@ enable_he() {
     printf 'HE_HOST_IPV6=%q\n' "$he_host"
     printf 'NATIVE_IFACE=%q\n' "$primary_iface"
     printf 'NATIVE_DISABLE_IPV6=%q\n' "$native_disabled"
+    printf 'BOOTSTRAP_FIREWALL=%q\n' "$firewall_backend"
   } > "$CONFIG_FILE"
 
   write_helpers
@@ -196,6 +338,7 @@ restore_native() {
     say '没有发现本脚本创建的 HE 配置，无需恢复。'
     return
   fi
+  . "$CONFIG_FILE"
   local confirm
   say '这会停止 HE 隧道、删除 HE 路由，并重新启用原生 IPv6。IPv4 不受影响。'
   confirm="$(ask '确认恢复原生 IPv6？输入 YES 继续')"
@@ -204,6 +347,9 @@ restore_native() {
   # If the unit had already failed, systemd may skip ExecStop; run the
   # idempotent cleanup helper once more to guarantee native IPv6 is restored.
   "$DOWN_SCRIPT" || true
+  if [ "${BOOTSTRAP_FIREWALL:-0}" = 1 ]; then
+    "$FIREWALL_HELPER" remove || die 'HE 隧道已关闭，但移除协议 41 白名单失败；请勿删除该文件并检查 nftables。'
+  fi
   systemctl daemon-reload
   say '原生 IPv6 已重新启用。若依赖 SLAAC/DHCPv6，地址和默认路由可能需要数秒恢复。'
 }
@@ -215,6 +361,7 @@ show_status() {
     say "已保存的 HE 业务 IPv6：$HE_HOST_IPV6"
     say "路由前缀：$ROUTED_PREFIX"
     say "原生 IPv6 网卡：$NATIVE_IFACE"
+    [ "${BOOTSTRAP_FIREWALL:-0}" = 1 ] && say "防火墙联动：已启用（仅允许 $SERVER_IPV4 的协议 41）" || say '防火墙联动：未启用'
     systemctl is-active --quiet he-ipv6-switch.service && say '状态：HE 独占 IPv6 已启用。' || say '状态：已保存配置，但 HE 服务未运行。'
   else
     say '状态：未配置 HE IPv6 Switch。'
