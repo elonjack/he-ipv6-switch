@@ -1,0 +1,24 @@
+name: Lint
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bash:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Bash syntax
+        run: |
+          bash -n he-ipv6-switch.sh
+          bash -n tests/validation.sh
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+      - name: Run ShellCheck
+        run: shellcheck --severity=error he-ipv6-switch.sh tests/validation.sh
+      - name: Test HE input validation
+        run: bash tests/validation.sh

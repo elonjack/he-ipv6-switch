@@ -18,11 +18,9 @@ BOOTSTRAP_FIREWALL_EXTENSION_DIR="/etc/vps-security/nftables-input.d"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   YELLOW='\033[1;33m'
-  RED='\033[1;31m'
   RESET='\033[0m'
 else
   YELLOW=''
-  RED=''
   RESET=''
 fi
 
@@ -42,10 +40,98 @@ ask() {
   fi
 }
 required() { [ -n "$1" ] || die "该项不能为空。"; }
-valid_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "不是 IPv4 地址：$1"; }
-valid_ipv6() { [[ "$1" =~ ^[0-9A-Fa-f:]+$ ]] || die "不是 IPv6 地址：$1"; }
+valid_ipv4() {
+  local candidate=$1 octet
+  local -a octets
+  IFS=. read -r -a octets <<< "$candidate"
+  [ "${#octets[@]}" -eq 4 ] || die "不是 IPv4 地址：$candidate"
+  for octet in "${octets[@]}"; do
+    [[ "$octet" =~ ^[0-9]{1,3}$ ]] && [ "$((10#$octet))" -le 255 ] || die "不是 IPv4 地址：$candidate"
+  done
+}
+
+# Convert a conventional IPv6 literal to 32 lowercase hexadecimal digits.
+# HE's Tunnel Details fields are IPv6 literals (not IPv4-embedded forms), so
+# deliberately accepting only this unambiguous form keeps generated commands safe.
+ipv6_to_hex() {
+  local candidate=$1 left right part missing output=''
+  local -a left_parts=() right_parts=() parts=()
+  [[ "$candidate" == *:* && "$candidate" != *':::'* ]] || return 1
+
+  if [[ "$candidate" == *'::'* ]]; then
+    left=${candidate%%::*}
+    right=${candidate#*::}
+    [[ "$right" != *'::'* ]] || return 1
+    [ -z "$left" ] || IFS=: read -r -a left_parts <<< "$left"
+    [ -z "$right" ] || IFS=: read -r -a right_parts <<< "$right"
+    [ "$(( ${#left_parts[@]} + ${#right_parts[@]} ))" -lt 8 ] || return 1
+    missing=$((8 - ${#left_parts[@]} - ${#right_parts[@]}))
+    parts=("${left_parts[@]}")
+    for ((part = 0; part < missing; part++)); do parts+=(0); done
+    parts+=("${right_parts[@]}")
+  else
+    IFS=: read -r -a parts <<< "$candidate"
+    [ "${#parts[@]}" -eq 8 ] || return 1
+  fi
+
+  for part in "${parts[@]}"; do
+    [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    printf -v part '%04x' "$((16#$part))"
+    output+=$part
+  done
+  printf '%s' "$output"
+}
+
+valid_ipv6() { ipv6_to_hex "$1" >/dev/null || die "不是 IPv6 地址：$1"; }
 valid_cidr() {
-  [[ "$1" == */* && "$1" =~ ^[0-9A-Fa-f:]+/[0-9]{1,3}$ ]] || die "IPv6 地址或前缀格式错误：$1"
+  local candidate=$1 address prefix
+  [[ "$candidate" == */* && "${candidate#*/}" != */* ]] || die "IPv6 地址或前缀格式错误：$candidate"
+  address=${candidate%/*}
+  prefix=${candidate#*/}
+  [[ "$prefix" =~ ^[0-9]{1,3}$ ]] && [ "$((10#$prefix))" -le 128 ] || die "IPv6 前缀长度必须在 0 到 128 之间：$candidate"
+  valid_ipv6 "$address"
+}
+valid_cidr_length() {
+  local candidate=$1 expected_length=$2
+  valid_cidr "$candidate"
+  [ "${candidate#*/}" = "$expected_length" ] || die "该地址必须使用 /$expected_length：$candidate"
+}
+valid_network_cidr() {
+  local candidate=$1 expected_length=$2 address prefix hex first_host_nibble remaining
+  valid_cidr_length "$candidate" "$expected_length"
+  address=${candidate%/*}
+  prefix=${candidate#*/}
+  hex=$(ipv6_to_hex "$address")
+  first_host_nibble=$((prefix / 4))
+  remaining=$((prefix % 4))
+  if [ "$remaining" -eq 0 ]; then
+    [[ "${hex:first_host_nibble}" =~ ^0*$ ]] || die "路由前缀的主机位必须为 0：$candidate"
+  else
+    [ "$((16#${hex:first_host_nibble:1} & ((1 << (4 - remaining)) - 1)))" -eq 0 ] &&
+      [[ "${hex:first_host_nibble+1}" =~ ^0*$ ]] || die "路由前缀的主机位必须为 0：$candidate"
+  fi
+}
+ipv6_in_cidr() {
+  local address=$1 cidr=$2 prefix network_hex address_hex full_nibbles remaining
+  prefix=${cidr#*/}
+  network_hex=$(ipv6_to_hex "${cidr%/*}") || return 1
+  address_hex=$(ipv6_to_hex "$address") || return 1
+  full_nibbles=$((prefix / 4))
+  remaining=$((prefix % 4))
+  [ "${address_hex:0:full_nibbles}" = "${network_hex:0:full_nibbles}" ] || return 1
+  [ "$remaining" -eq 0 ] || [ "$((16#${address_hex:full_nibbles:1} >> (4 - remaining)))" -eq "$((16#${network_hex:full_nibbles:1} >> (4 - remaining)))" ]
+}
+default_host_for_prefix() {
+  local prefix=$1 base hex
+  base=${prefix%/*}
+  if [[ "$base" == *'::' ]]; then
+    printf '%s1' "$base"
+    return
+  fi
+  hex=$(ipv6_to_hex "$base") || return 1
+  printf '%s:%s:%s:%s:%s:%s:%s:1' \
+    "${hex:0:4}" "${hex:4:4}" "${hex:8:4}" "${hex:12:4}" \
+    "${hex:16:4}" "${hex:20:4}" "${hex:24:4}"
 }
 have_setup() { [ -f "$CONFIG_FILE" ] && [ -f "$SERVICE_FILE" ]; }
 bootstrap_firewall_active() {
@@ -241,9 +327,9 @@ enable_he() {
   required "$server_ipv4"; valid_ipv4 "$server_ipv4"
   required "$server_ipv6"; valid_ipv6 "$server_ipv6"
   required "$client_ipv4"; valid_ipv4 "$client_ipv4"
-  required "$client_ipv6"; valid_cidr "$client_ipv6"
-  required "$routed64"; valid_cidr "$routed64"
-  [ -z "$routed48" ] || valid_cidr "$routed48"
+  required "$client_ipv6"; valid_cidr_length "$client_ipv6" 64
+  required "$routed64"; valid_network_cidr "$routed64" 64
+  [ -z "$routed48" ] || valid_network_cidr "$routed48" 48
 
   if [ -n "$routed48" ]; then
     say ''
@@ -258,11 +344,13 @@ enable_he() {
     2) routed_prefix="$routed64" ;;
     *) die '只能选择 1 或 2。' ;;
   esac
-  # HE displays routed prefixes in compressed form (for example ...::/48).
   # The first usable address is a sensible default and avoids manual typo risk.
-  default_he_host="${routed_prefix%/*}1"
+  # Usually HE displays it as ...::1; a fully expanded but identical address is
+  # used only if the pasted prefix was written without a trailing ::.
+  default_he_host="$(default_host_for_prefix "$routed_prefix")"
   he_host="$(ask "从 $routed_prefix 中选一个给 VPS 使用的 HE IPv6（直接回车使用默认地址）" "$default_he_host")"
   required "$he_host"; valid_ipv6 "$he_host"
+  ipv6_in_cidr "$he_host" "$routed_prefix" || die "该 HE IPv6 不属于所选 Routed 前缀：$he_host"
 
   if bootstrap_firewall_active; then
     firewall_backend=1
@@ -325,7 +413,16 @@ enable_he() {
   write_service
   install -m 0755 "$0" "$INSTALL_PATH"
   systemctl daemon-reload
-  systemctl enable --now he-ipv6-switch.service
+  if ! systemctl enable --now he-ipv6-switch.service; then
+    # Leave the VPS reachable through its pre-existing network if the new
+    # tunnel cannot be brought up (for example, protocol 41 is blocked).
+    systemctl disable --now he-ipv6-switch.service 2>/dev/null || true
+    "$DOWN_SCRIPT" 2>/dev/null || true
+    if [ "$firewall_backend" = 1 ]; then
+      "$FIREWALL_HELPER" remove 2>/dev/null || true
+    fi
+    die 'HE 隧道启动失败，已清理隧道、HE 路由和本脚本的协议 41 白名单；原生 IPv6 已重新启用。请检查 HE 参数、云防火墙及 IP 协议 41。'
+  fi
   say ''
   say 'HE 独占 IPv6 已启用，并已设为开机自启。'
   say "当前 HE 业务地址：$he_host"
@@ -386,4 +483,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
