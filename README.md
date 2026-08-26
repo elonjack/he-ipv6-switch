@@ -23,10 +23,24 @@
 - Routed /64
 - Routed /48（若 HE 已分配）
 
-然后在 VPS 上运行：
+### 直接在 VPS 下载并运行
+
+以 `root` 登录 VPS 后，复制**整行**执行。它会先下载脚本，再立即打开中文交互菜单；`&&` 确保下载失败时不会继续执行：
 
 ```bash
-sudo bash he-ipv6-switch.sh
+curl -fsSLo /root/he-ipv6-switch.sh https://github.com/elonjack/he-ipv6-switch/releases/latest/download/he-ipv6-switch.sh && bash /root/he-ipv6-switch.sh
+```
+
+若系统没有 `curl`，可使用：
+
+```bash
+wget -O /root/he-ipv6-switch.sh https://github.com/elonjack/he-ipv6-switch/releases/latest/download/he-ipv6-switch.sh && bash /root/he-ipv6-switch.sh
+```
+
+已下载过脚本时，直接运行：
+
+```bash
+bash /root/he-ipv6-switch.sh
 ```
 
 按菜单选择“启用 / 重新配置 HE 独占 IPv6”。日后再次运行同一脚本，选择“恢复原生 IPv6”即可切回。
